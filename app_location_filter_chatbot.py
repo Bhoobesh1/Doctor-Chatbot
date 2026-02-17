@@ -17,8 +17,8 @@ from voice_of_the_doctor import text_to_speech_openai
 
 # ---------------- SYSTEM PROMPT ----------------
 SYSTEM_PROMPT = """
-You are a highly experienced doctor.
-Respond only for awareness purposes.
+You are an experienced doctor.
+Respond for awareness purposes only.
 Suggest likely causes and simple home remedies.
 Speak calmly and clearly.
 Keep response short and reassuring.
@@ -50,7 +50,7 @@ def analyze_text_only(query):
     )
     return r.choices[0].message.content.strip()
 
-# ---------------- OSM SEARCH ----------------
+# ---------------- FETCH NEARBY HOSPITALS ----------------
 def get_nearby_hospitals(lat, lon):
     query = f"""
     [out:json];
@@ -62,7 +62,11 @@ def get_nearby_hospitals(lat, lon):
     """
 
     try:
-        r = requests.post("https://overpass-api.de/api/interpreter", data=query, timeout=30)
+        r = requests.post(
+            "https://overpass-api.de/api/interpreter",
+            data=query,
+            timeout=30
+        )
         data = r.json()
     except:
         return []
@@ -77,9 +81,76 @@ def get_nearby_hospitals(lat, lon):
                 "lon": e["lon"]
             })
 
-    return hospitals[:5]
+    return hospitals[:50]
 
-# ---------------- MAP ----------------
+# ---------------- DETECT CATEGORY ----------------
+def detect_category(query):
+    q = query.lower()
+
+    if any(word in q for word in ["skin", "rash", "itch", "acne"]):
+        return "dermatology"
+
+    elif any(word in q for word in ["eye", "vision", "blur", "red eye"]):
+        return "ophthalmology"
+
+    elif any(word in q for word in ["bone", "fracture", "joint", "ortho"]):
+        return "orthopedic"
+
+    elif any(word in q for word in ["heart", "chest pain", "cardio"]):
+        return "cardiology"
+
+    else:
+        return "general"
+
+# ---------------- SMART CLASSIFICATION ----------------
+def classify_hospitals(hospitals, query_text):
+
+    category = detect_category(query_text)
+    filtered = []
+
+    for h in hospitals:
+        name = h["name"].lower()
+
+        # Always include multi-speciality hospitals
+        if any(word in name for word in [
+            "multi", "multispeciality", "multi-speciality",
+            "general hospital"
+        ]):
+            filtered.append(h)
+            continue
+
+        # GENERAL PROBLEMS
+        if category == "general":
+            if "clinic" in name or "hospital" in name:
+                filtered.append(h)
+
+        # SPECIALIST PROBLEMS
+        else:
+            if category == "dermatology":
+                if any(word in name for word in ["skin", "derma"]):
+                    filtered.append(h)
+
+            elif category == "ophthalmology":
+                if any(word in name for word in ["eye", "vision", "ophthal"]):
+                    filtered.append(h)
+
+            elif category == "orthopedic":
+                if any(word in name for word in ["ortho", "bone"]):
+                    filtered.append(h)
+
+            elif category == "cardiology":
+                if any(word in name for word in ["heart", "cardio"]):
+                    filtered.append(h)
+
+    # Fallback for specialist cases
+    if not filtered and category != "general":
+        for h in hospitals:
+            if "hospital" in h["name"].lower():
+                filtered.append(h)
+
+    return filtered
+
+# ---------------- GENERATE MAP ----------------
 def generate_map(lat, lon, hospitals):
 
     markers = ""
@@ -98,7 +169,7 @@ def generate_map(lat, lon, hospitals):
 <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
 </head>
 <body style="margin:0">
-<div id="map" style="height:400px;"></div>
+<div id="map" style="height:450px;"></div>
 <script>
 var map = L.map("map").setView([{lat},{lon}],14);
 
@@ -117,9 +188,9 @@ L.marker([{lat},{lon}])
 </html>
 """
 
-    return f'<iframe srcdoc="{html.replace(chr(34),"&quot;")}" style="width:100%;height:420px;border:none;"></iframe>'
+    return f'<iframe srcdoc="{html.replace(chr(34),"&quot;")}" style="width:100%;height:470px;border:none;"></iframe>'
 
-# ---------------- MAIN LOGIC ----------------
+# ---------------- MAIN FUNCTION ----------------
 def process_inputs(audio, lat, lon):
 
     if not audio:
@@ -127,9 +198,7 @@ def process_inputs(audio, lat, lon):
 
     text = transcribe_with_openai(audio)
 
-    is_medical = is_medical_query_ai(text)
-
-    if not is_medical:
+    if not is_medical_query_ai(text):
         return text, "Please ask health related questions only", None, None
 
     response = analyze_text_only(text)
@@ -138,12 +207,13 @@ def process_inputs(audio, lat, lon):
 
     if lat and lon:
         hospitals = get_nearby_hospitals(float(lat), float(lon))
+        classified = classify_hospitals(hospitals, text)
 
-        if hospitals:
-            response += "\n\nNearby hospitals include:\n"
-            response += "\n".join(h["name"] for h in hospitals)
+        if classified:
+            response += "\n\nRecommended hospitals:\n"
+            response += "\n".join(h["name"] for h in classified)
 
-        map_html = generate_map(float(lat), float(lon), hospitals)
+        map_html = generate_map(float(lat), float(lon), classified)
 
     audio_out = text_to_speech_openai(response)
 
@@ -159,7 +229,6 @@ with gr.Blocks() as demo:
 
     location_btn = gr.Button("📍 Get My Location")
 
-    # ✅ Correct JS → Python Location Passing
     location_btn.click(
         fn=None,
         inputs=None,
@@ -185,11 +254,18 @@ with gr.Blocks() as demo:
     )
 
     audio = gr.Audio(sources=["microphone"], type="filepath")
-
     consult_btn = gr.Button("Consult Doctor")
 
-    txt_in = gr.Textbox(label="Patient Input")
-    txt_out = gr.Textbox(label="Doctor Response")
+    with gr.Row():
+        txt_in = gr.Textbox(label="Patient Input", scale=1)
+
+        txt_out = gr.Textbox(
+            label="Doctor Response",
+            lines=14,
+            max_lines=20,
+            scale=2
+        )
+
     audio_out = gr.Audio(autoplay=True)
     map_out = gr.HTML()
 
