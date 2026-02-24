@@ -17,27 +17,64 @@ from voice_of_the_doctor import text_to_speech_openai
 
 # ---------------- SYSTEM PROMPT ----------------
 SYSTEM_PROMPT = """
-You are an experienced doctor.
-Respond for awareness purposes only.
-Suggest likely causes and simple home remedies.
-Speak calmly and clearly.
-Keep response short and reassuring.
-Avoid medical jargon.
-Start directly without greeting.
-"""
+You are a senior medical doctor with decades of clinical experience.
 
+Respond only to medical or health-related questions.
+If the question is not related to health or medicine, reply:
+"This assistant provides only medical guidance."
+
+For medical questions:
+
+• Explain likely causes calmly and clearly.
+• Suggest simple home remedies when appropriate.
+• Do not assume symptoms that were not mentioned.
+• Do not provide a confirmed diagnosis.
+
+IMPORTANT:
+If symptoms relate to a specific organ system such as eyes, heart, chest, bones, skin, or general illness,
+clearly recommend consulting the appropriate specialist or visiting a nearby hospital.
+
+For example:
+- Eye symptoms → recommend an ophthalmologist.
+- Heart or chest symptoms → recommend a cardiologist or emergency care.
+
+Keep the response short, natural, and reassuring.
+Avoid medical jargon.
+Do not exaggerate.
+Start directly without greetings.
+"""
 # ---------------- MEDICAL CHECK ----------------
 def is_medical_query_ai(text):
     r = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
-            {"role": "system", "content": "Reply YES or NO. Is this medical?"},
+            {
+                "role": "system",
+                "content": """
+You are a strict classifier.
+
+If the user message contains:
+- symptoms
+- body pain
+- bleeding
+- blood
+- health concerns
+- diseases
+- food related to health
+- treatment questions
+
+Reply ONLY: YES
+
+If it is clearly non-medical (coding, travel, politics, etc.), reply ONLY: NO
+"""
+            },
             {"role": "user", "content": text}
         ],
+        temperature=0.3,
         max_tokens=3
     )
-    return r.choices[0].message.content.strip().upper() == "YES"
 
+    return r.choices[0].message.content.strip().upper() == "YES"
 # ---------------- DOCTOR RESPONSE ----------------
 def analyze_text_only(query):
     r = client.chat.completions.create(
@@ -46,6 +83,7 @@ def analyze_text_only(query):
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": query}
         ],
+        temperature=0.2,
         max_tokens=200
     )
     return r.choices[0].message.content.strip()
@@ -90,7 +128,7 @@ def detect_category(query):
     if any(word in q for word in ["skin", "rash", "itch", "acne"]):
         return "dermatology"
 
-    elif any(word in q for word in ["eye", "vision", "blur", "red eye"]):
+    elif any(word in q for word in ["eyes","eye","vision", "blur", "red eye"]):
         return "ophthalmology"
 
     elif any(word in q for word in ["bone", "fracture", "joint", "ortho"]):
@@ -108,24 +146,45 @@ def classify_hospitals(hospitals, query_text):
     category = detect_category(query_text)
     filtered = []
 
+    # Specialist keywords to exclude in general cases
+    specialist_words = [
+        "eye", "cardio", "heart", "ortho", "bone",
+        "skin", "derma", "maternity", "child",
+        "cancer", "dental", "ayurveda", "homeo"
+    ]
+
     for h in hospitals:
         name = h["name"].lower()
 
-        # Always include multi-speciality hospitals
-        if any(word in name for word in [
-            "multi", "multispeciality", "multi-speciality",
-            "general hospital"
-        ]):
-            filtered.append(h)
-            continue
-
-        # GENERAL PROBLEMS
+        # ---------------- GENERAL CASE ----------------
         if category == "general":
-            if "clinic" in name or "hospital" in name:
+
+            # Skip specialist hospitals
+            if any(word in name for word in specialist_words):
+                continue
+
+            # Allow general hospitals AND clinics
+            if any(word in name for word in [
+                "hospital",
+                "clinic",
+                "general",
+                "multi",
+                "government",
+                "medical college"
+            ]):
                 filtered.append(h)
 
-        # SPECIALIST PROBLEMS
+        # ---------------- SPECIALIST CASES ----------------
         else:
+
+            # Always allow multi speciality hospitals
+            if any(word in name for word in [
+                "multi", "multispeciality", "multi-speciality",
+                "general hospital", "government"
+            ]):
+                filtered.append(h)
+                continue
+
             if category == "dermatology":
                 if any(word in name for word in ["skin", "derma"]):
                     filtered.append(h)
@@ -142,14 +201,14 @@ def classify_hospitals(hospitals, query_text):
                 if any(word in name for word in ["heart", "cardio"]):
                     filtered.append(h)
 
-    # Fallback for specialist cases
-    if not filtered and category != "general":
+    # Fallback: if nothing found, show general hospitals
+    if not filtered:
         for h in hospitals:
-            if "hospital" in h["name"].lower():
+            name = h["name"].lower()
+            if "hospital" in name or "clinic" in name:
                 filtered.append(h)
 
     return filtered
-
 # ---------------- GENERATE MAP ----------------
 def generate_map(lat, lon, hospitals):
 
@@ -192,33 +251,36 @@ L.marker([{lat},{lon}])
 
 # ---------------- MAIN FUNCTION ----------------
 def process_inputs(audio, lat, lon):
+    try:
+        if not audio:
+            return "", "Please speak your health concern", None, None
 
-    if not audio:
-        return "", "Please speak your health concern", None, None
+        text = transcribe_with_openai(audio)
 
-    text = transcribe_with_openai(audio)
+        if not is_medical_query_ai(text):
+            return text, "Please ask health related questions only", None, None
 
-    if not is_medical_query_ai(text):
-        return text, "Please ask health related questions only", None, None
+        response = analyze_text_only(text)
 
-    response = analyze_text_only(text)
+        map_html = None
 
-    map_html = None
+        if lat and lon:
+            hospitals = get_nearby_hospitals(float(lat), float(lon))
+            classified = classify_hospitals(hospitals, text)
 
-    if lat and lon:
-        hospitals = get_nearby_hospitals(float(lat), float(lon))
-        classified = classify_hospitals(hospitals, text)
+            if classified:
+                response += "\n\nRecommended hospitals:\n"
+                response += "\n".join(h["name"] for h in classified)
 
-        if classified:
-            response += "\n\nRecommended hospitals:\n"
-            response += "\n".join(h["name"] for h in classified)
+            map_html = generate_map(float(lat), float(lon), classified)
 
-        map_html = generate_map(float(lat), float(lon), classified)
+        audio_out = text_to_speech_openai(response)
 
-    audio_out = text_to_speech_openai(response)
+        return text, response, audio_out, map_html
 
-    return text, response, audio_out, map_html
-
+    except Exception as e:
+        print("ERROR:", e)
+        return "", "System error occurred", None, None
 # ---------------- UI ----------------
 with gr.Blocks() as demo:
 
@@ -257,7 +319,11 @@ with gr.Blocks() as demo:
     consult_btn = gr.Button("Consult Doctor")
 
     with gr.Row():
-        txt_in = gr.Textbox(label="Patient Input", scale=1)
+        txt_in = gr.Textbox(
+            label="Patient Input",
+            lines=10,
+            max_lines=10, 
+            scale=1)
 
         txt_out = gr.Textbox(
             label="Doctor Response",
@@ -275,4 +341,11 @@ with gr.Blocks() as demo:
         outputs=[txt_in, txt_out, audio_out, map_out]
     )
 
-demo.launch(server_port=7861)
+# ---------------- SAFE LAUNCH ----------------
+if __name__ == "__main__":
+    demo.queue()   
+    demo.launch(
+        server_name="127.0.0.1",
+        server_port=7861,
+        debug=True
+    )
