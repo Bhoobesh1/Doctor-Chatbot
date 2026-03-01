@@ -17,34 +17,27 @@ from voice_of_the_doctor import text_to_speech_openai
 
 # ---------------- SYSTEM PROMPT ----------------
 SYSTEM_PROMPT = """
-You are a senior medical doctor.
+You are a highly experienced senior medical doctor.
 
-Respond ONLY to medical questions.
+Respond ONLY to medical or health-related questions.
 If not medical, reply exactly:
 "This assistant provides only medical guidance."
 
-Do not give confirmed diagnoses.
-Do not assume symptoms.
-Do not exaggerate.
-Use simple language.
+Do NOT give confirmed diagnoses.
+Do NOT assume symptoms not mentioned.
+Keep answers short, calm and clear.
 
-For medical questions:
-• Explain possible causes briefly.
-• Suggest simple home care if appropriate.
-• Say when to see a doctor.
-• Recommend correct specialist:
-  - Eye → Ophthalmologist
-  - Skin → Dermatologist
-  - Bone/joint → Orthopedic
-  - Heart/chest → Cardiologist or emergency
-  - Fever/cold/general → General physician
+If symptoms involve:
+- Eye → Ophthalmologist
+- Skin → Dermatologist
+- Bone/joint → Orthopedic doctor
+- Heart/chest → Cardiologist or emergency care
+- General fever/cold → General physician
 
-If symptoms are severe (chest pain, breathing trouble, heavy bleeding, unconsciousness),
+If severe symptoms like chest pain, breathing difficulty,
 advise immediate emergency care.
-
-Keep responses short, calm, and natural.
-No greetings.
 """
+
 # ---------------- MEDICAL CHECK ----------------
 def is_medical_query_ai(text):
     r = client.chat.completions.create(
@@ -80,7 +73,7 @@ If it is clearly non-medical (coding, travel, politics, etc.), reply ONLY: NO
 # ---------------- DOCTOR RESPONSE ----------------
 def analyze_text_only(query):
     r = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-4.1-mini",
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": query}
@@ -123,7 +116,7 @@ def get_nearby_hospitals(lat, lon):
 
     return hospitals[:50]
 
-# ---------------- DETECT CATEGORY ----------------
+# ---------------- CATEGORY DETECTION ----------------
 def detect_category(query):
     q = query.lower()
 
@@ -151,7 +144,7 @@ def detect_category(query):
     else:
         return "general"
 
-# ---------------- SMART CLASSIFICATION ----------------
+# ---------------- HOSPITAL FILTER ----------------
 def classify_hospitals(hospitals, query_text):
 
     category = detect_category(query_text)
@@ -216,7 +209,7 @@ def classify_hospitals(hospitals, query_text):
                 filtered.append(h)
 
     return filtered
-# ---------------- GENERATE MAP ----------------
+# ---------------- MAP GENERATOR ----------------
 def generate_map(lat, lon, hospitals):
 
     markers = ""
@@ -255,20 +248,20 @@ L.marker([{lat},{lon}])
 """
 
     return f'<iframe srcdoc="{html.replace(chr(34),"&quot;")}" style="width:100%;height:470px;border:none;"></iframe>'
-
 # ---------------- MAIN FUNCTION ----------------
-def process_inputs(audio, lat, lon):
+def process_inputs(audio, text_input, lat, lon):
     try:
-        if not audio:
-            return "", "Please speak your health concern", None, None
-
-        text = transcribe_with_openai(audio)
+        if text_input and text_input.strip() != "":
+            text = text_input.strip()
+        elif audio:
+            text = transcribe_with_openai(audio)
+        else:
+            return "", "Please speak or type your health concern", None, None
 
         if not is_medical_query_ai(text):
             return text, "Please ask health related questions only", None, None
 
         response = analyze_text_only(text)
-
         map_html = None
 
         if lat and lon:
@@ -288,6 +281,7 @@ def process_inputs(audio, lat, lon):
     except Exception as e:
         print("ERROR:", e)
         return "", "System error occurred", None, None
+
 # ---------------- UI ----------------
 with gr.Blocks() as demo:
 
@@ -323,36 +317,28 @@ with gr.Blocks() as demo:
     )
 
     audio = gr.Audio(sources=["microphone"], type="filepath")
+    text_input = gr.Textbox(
+        label="Type Your Health Concern",
+        placeholder="Describe your symptoms here...",
+        lines=3
+    )
+
     consult_btn = gr.Button("Consult Doctor")
 
     with gr.Row():
-        txt_in = gr.Textbox(
-            label="Patient Input",
-            lines=10,
-            max_lines=10, 
-            scale=1)
-
-        txt_out = gr.Textbox(
-            label="Doctor Response",
-            lines=14,
-            max_lines=20,
-            scale=2
-        )
+        txt_in = gr.Textbox(label="Patient Input", lines=6)
+        txt_out = gr.Textbox(label="Doctor Response", lines=12)
 
     audio_out = gr.Audio(autoplay=True)
     map_out = gr.HTML()
 
     consult_btn.click(
         process_inputs,
-        inputs=[audio, lat, lon],
+        inputs=[audio, text_input, lat, lon],
         outputs=[txt_in, txt_out, audio_out, map_out]
     )
 
-# ---------------- SAFE LAUNCH ----------------
+# ---------------- LAUNCH ----------------
 if __name__ == "__main__":
-    demo.queue()   
-    demo.launch(
-        server_name="127.0.0.1",
-        server_port=7861,
-        debug=True
-    )
+    demo.queue()
+    demo.launch(server_name="127.0.0.1", server_port=7861, debug=True)

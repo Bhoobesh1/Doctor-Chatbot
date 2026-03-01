@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify
-import pdfplumber
+import PyPDF2
 import faiss
 import numpy as np
 import pickle
@@ -22,24 +22,15 @@ INDEX_FILE = "faiss.index"
 chunks = []
 index = None
 
-# ---------------- METRICS ----------------
-metrics = {
-    "total_questions": 0,
-    "retrieval_hits": 0,
-    "total_similarity": 0.0,
-    "hallucinations": 0,
-    "safety_flags": 0
-}
-
 # ---------------- CHAT MEMORY ----------------
 conversation_memory = []
 MAX_MEMORY = 6
 
 # ---------------- RETRIEVAL SETTINGS ----------------
-TOP_K = 7               
-DISTANCE_THRESHOLD = 0.3    
+TOP_K = 10                  
+DISTANCE_THRESHOLD = 1.4    
 CHUNK_SIZE = 450            
-CHUNK_OVERLAP = 150       
+CHUNK_OVERLAP = 120       
 # ---------------- SMALL TALK ----------------
 def handle_small_talk(user_input: str):
     text = user_input.lower().strip()
@@ -92,7 +83,7 @@ def make_chunks(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
 # ---------------- BUILD FAISS ----------------
 def build_faiss_index(embeddings):
     dimension = embeddings.shape[1]
-    idx = faiss.IndexFlatIP(dimension)
+    idx = faiss.IndexFlatL2(dimension)
     idx.add(embeddings)
     return idx
 
@@ -119,64 +110,6 @@ def build_memory_text() -> str:
         lines.append(f"User: {m['question']}\nAssistant: {m['answer']}")
     return "\n\n".join(lines) + "\n\n"
 
-# ---------------- HALLUCINATION CHECK ----------------
-def detect_hallucination(answer, context):
-    check_prompt = f"""
-    You are a strict evaluator.
-
-    Context:
-    {context}
-
-    Answer:
-    {answer}
-
-    Does the answer contain information NOT present in the context?
-
-    Reply with only:
-    - SAFE (if fully grounded in context)
-    - HALLUCINATION (if it adds unsupported facts)
-    """
-
-    try:
-            check = client.chat.completions.create(
-                model="gpt-4o-mini",
-                max_tokens=10,
-                messages=[{"role": "user", "content": check_prompt}]
-            )
-            verdict = check.choices[0].message.content.strip().upper()
-            return verdict
-    except Exception as e:
-        print(f"Hallucination check error: {e}")
-        return "UNKNOWN"
-    
-
-# ---------------- SAFETY FILTER ----------------
-# ---------------- SAFETY FILTER ----------------
-def safety_filter(text: str) -> bool:
-    """
-    Returns True if unsafe or high-risk medical advice is detected.
-    """
-
-    unsafe_phrases = [
-        "suicide",
-        "kill yourself",
-        "self-harm",
-        "overdose",
-        "take too much",
-        "double the dose",
-        "ignore your doctor",
-        "no need to see a doctor",
-        "stop medication immediately"
-    ]
-
-    text_lower = text.lower()
-
-    for phrase in unsafe_phrases:
-        if phrase in text_lower:
-            return True
-
-    return False
-
 # ---------------- PDF UPLOAD ----------------
 @app.route("/upload", methods=["POST"])
 def upload_pdf():
@@ -190,12 +123,13 @@ def upload_pdf():
     if not pdf.filename.endswith(".pdf"):
         return jsonify({"message": "❌ Please upload a valid PDF file"}), 400
 
-    with pdfplumber.open(pdf) as pdf_doc:
-        text = ""
-        for page in pdf_doc.pages:
-            page_text = page.extract_text()
-            if page_text:
-                text += page_text
+    reader = PyPDF2.PdfReader(pdf)
+    text = ""
+    for page in reader.pages:
+        page_text = page.extract_text()
+        if page_text:
+            text += page_text
+
     if not text.strip():
         return jsonify({"message": "❌ No readable text found in PDF"}), 400
 
@@ -203,7 +137,7 @@ def upload_pdf():
     chunks = make_chunks(text)
 
     # Create Embeddings
-    embeddings = embedding_model.encode(chunks, normalize_embeddings=True)
+    embeddings = embedding_model.encode(chunks)
     embeddings = np.array(embeddings).astype("float32")
 
     # Build FAISS
@@ -221,7 +155,7 @@ def upload_pdf():
 # ---------------- ASK QUESTION ----------------
 @app.route("/ask", methods=["POST"])
 def ask():
-    global chunks, index, conversation_memory, metrics
+    global chunks, index, conversation_memory
 
     data = request.get_json()
     if not data:
@@ -251,94 +185,51 @@ def ask():
                 "Please ask something related to skin health or conditions!"
             )
         })
-    
-    metrics["total_questions"] += 1
-
-    if safety_filter(question):
-        metrics["safety_flags"] += 1
-        return jsonify({"answer": "⚠️ I can't assist with that type of request. Please consult a medical professional."})
 
     # --- PDF check ---
     if index is None or not chunks:
         return jsonify({"answer": "❌ Please upload a PDF first so I can answer your question."})
 
-    followup_indicators = [
-        "it", "its", "this", "that", "these", "those",
-        "the drug", "the treatment", "the condition",
-        "same", "above", "mentioned", "said"
-    ]
+    # --- Build contextual query for retrieval ---
+    recent_memory = []
+    for m in conversation_memory[-3:]:
+        recent_memory.append(m["question"])
+        recent_memory.append(m["answer"])
 
-    question_lower = question.lower()
-    is_followup = any(word in question_lower.split() for word in followup_indicators)
+    retrieval_query = " ".join(recent_memory + [question])
 
-    if is_followup and conversation_memory:
-        last_question = conversation_memory[-1]["question"]
-        retrieval_query = last_question + " " + question
-    else:
-        retrieval_query = question
-
-    print(f"\n🔄 Retrieval Query: {retrieval_query}")
     # --- Embed Question with Context ---
-    q_embedding = embedding_model.encode([retrieval_query],normalize_embeddings=True)
+    q_embedding = embedding_model.encode([retrieval_query])
     q_embedding = np.array(q_embedding).astype("float32")
 
     # Retrieve TOP_K chunks, filter by distance threshold
     k = min(TOP_K, len(chunks))
     distances, indices = index.search(q_embedding, k)
-    
-    best_distance = float(distances[0][0])
-    metrics["total_similarity"] += best_distance
 
     context_chunks = []
-    retrieval_debug = []
-
     for dist, idx in zip(distances[0], indices[0]):
-        if idx < len(chunks):
-            retrieval_debug.append({
-                "chunk_index": int(idx),
-                "distance": float(dist),
-                "chunk_preview": chunks[idx][:200]
-            })
+        if idx < len(chunks) and dist <= DISTANCE_THRESHOLD:
+            context_chunks.append(chunks[idx])
 
-            if dist >= DISTANCE_THRESHOLD:
-                context_chunks.append(chunks[idx])
-    print("\n📊 SIMILARITY SCORES:")
-    for item in retrieval_debug:
-        print(f"Chunk {item['chunk_index']} | Distance: {item['distance']}")
-
-    if context_chunks:
-        metrics["retrieval_hits"] += 1
     # Fallback: if all chunks were filtered, use top 3 anyway
     if not context_chunks:
         context_chunks = [chunks[i] for i in indices[0][:3] if i < len(chunks)]
 
     context = "\n\n".join(context_chunks)
-    print("\n" + "="*60)
-    print("🔍 USER QUESTION:")
-    print(question)
-    print("\n📦 RETRIEVED CHUNKS:")
-    for i, chunk in enumerate(context_chunks):
-        print(f"\n--- Chunk {i+1} ---")
-        print(chunk[:500])  # print first 500 characters
-    print("="*60 + "\n")
 
-    
     # --- Build Memory ---
     memory_text = build_memory_text()
 
     # --- Build Prompt (less strict) ---
-    prompt = f"""You are a dermatology assistant.
+    prompt = f"""You are a helpful dermatology assistant. Answer the user's question using the provided context from the uploaded PDF.
 
-You MUST answer using ONLY the information provided in the context below.
-
-Rules:
-- Do NOT use external medical knowledge.
-- Do NOT add assumptions.
-- If the answer is not clearly supported by the context, respond exactly with:
-  "Information not available in knowledge base."
-- If partially supported, answer only the supported part and clearly state the limitation.
-- If the question refers to previous conversation, use it only to understand the question — not to add new facts.
-Be precise, factual, and grounded strictly in the context.
+Guidelines:
+- Prefer answers from the provided context.
+- If the context partially covers the topic, answer based on what is available and mention any limitations.
+- Only say "Information not available in knowledge base." if the context has absolutely NO relevant information.
+- Be clear, concise, and helpful.
+- If the question references a previous answer (e.g. "tell me more", "explain that"), use the conversation history to understand what was asked before.
+- Do not make up clinical facts not supported by the context.
 
 {f"Previous Conversation:{chr(10)}{memory_text}" if memory_text else ""}
 Context from PDF:
@@ -367,19 +258,7 @@ Answer:"""
         answer = response.choices[0].message.content.strip()
     except Exception as e:
         return jsonify({"answer": f"❌ Error generating answer: {str(e)}"})
-    
-    hallucination_status = detect_hallucination(answer, context)
-    print(f"\n🛑 Hallucination Check: {hallucination_status}")
 
-    if hallucination_status == "HALLUCINATION":
-        metrics["hallucinations"] += 1
-    elif hallucination_status == "SAFE":
-        pass
-    else:
-        print("⚠️ Hallucination check inconclusive.")
-
-    if safety_filter(answer):
-        metrics["safety_flags"] += 1
     # --- Save to Memory ---
     conversation_memory.append({"question": question, "answer": answer})
     if len(conversation_memory) > MAX_MEMORY:
@@ -387,64 +266,6 @@ Answer:"""
 
     return jsonify({"answer": answer})
 
-
-@app.route("/metrics", methods=["GET"])
-def get_metrics():
-    if metrics["total_questions"] == 0:
-        return jsonify({"message": "No data yet"})
-
-    total = metrics["total_questions"]
-
-    # ---------------- RAW METRICS ----------------
-    hit_rate = metrics["retrieval_hits"] / total
-    hallucination_rate = metrics["hallucinations"] / total
-    safety_rate = 1 - (metrics["safety_flags"] / total)
-
-    avg_similarity = metrics["total_similarity"] / total
-
-    # ---------------- SCORES OUT OF 5 ----------------
-    # Grounding = Retrieval × Faithfulness
-    grounding_score = (hit_rate * (1 - hallucination_rate)) * 5
-
-    # Relevance proxy = Hit rate
-    relevance_score = hit_rate * 5
-
-    # Safety score
-    safety_score = safety_rate * 5
-
-    # Fluency (proxy — assume GPT high quality)
-    fluency_score = 4.8  
-
-    # Personalization (simple proxy using memory usage)
-    personalization_score = 4.5 if total > 3 else 4.0
-
-    # ---------------- FINAL WEIGHTED SCORE ----------------
-    final_score = (
-        0.35 * grounding_score +
-        0.25 * relevance_score +
-        0.15 * fluency_score +
-        0.15 * safety_score +
-        0.10 * personalization_score
-    )
-
-    return jsonify({
-        "Total Questions": total,
-
-        # Raw
-        "HitRate@K": round(hit_rate, 3),
-        "Hallucination Rate": round(hallucination_rate, 3),
-        "User Safety Rate": round(safety_rate, 3),
-        "Average Similarity (Cosine Higher=Better)": round(avg_similarity, 3),
-
-        # Scores out of 5
-        "Grounding (1-5)": round(grounding_score, 2),
-        "Relevance (1-5)": round(relevance_score, 2),
-        "Fluency (1-5)": round(fluency_score, 2),
-        "User Safety (1-5)": round(safety_score, 2),
-        "Personalization (1-5)": round(personalization_score, 2),
-
-        "Final System Score (1-5)": round(final_score, 2)
-    })
 # ---------------- CLEAR MEMORY ----------------
 @app.route("/clear-memory", methods=["POST"])
 def clear_memory():
